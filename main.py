@@ -1,145 +1,138 @@
+import asyncio
 import torch
 import numpy as np
 import pandas as pd
-import requests
-from tqdm import tqdm
+from abc import ABC, abstractmethod
+from typing import List
+from pydantic import BaseModel, HttpUrl, ConfigDict
+from pydantic_settings import BaseSettings
+from tenacity import retry, stop_after_attempt, wait_exponential
+from tqdm.asyncio import tqdm
+import httpx
 from sklearn.cluster import HDBSCAN
 
-class BlueOceanFinder:
-    def __init__(self, model_name="mxbai-embed-large", device=None):
-        self.model_name = model_name
-        self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        # В 2026 году эндпоинт /api/embed является стандартом для векторов
-        self.ollama_url = "http://localhost:11434/api/embed"
-        print(f"[*] Система запущена на устройстве: {self.device}")
+# --- 1. Конфигурация ---
 
-    def _get_embeddings_batch(self, texts, batch_size=32):
-        """Получение эмбеддингов через Ollama с поддержкой нового API."""
-        all_embeddings = []
-        for i in tqdm(range(0, len(texts), batch_size), desc="Векторизация"):
-            batch = texts[i:i+batch_size]
-            for text in batch:
-                try:
-                    res = requests.post(self.ollama_url, 
-                                     json={"model": self.model_name, "input": text}, 
-                                     timeout=15).json()
-                    
-                    # Проверка ключей ответа (зависит от версии Ollama)
-                    if 'embeddings' in res:
-                        # Новый формат возвращает список списков
-                        all_embeddings.append(res['embeddings'][0])
-                    elif 'embedding' in res:
-                        all_embeddings.append(res['embedding'])
-                    else:
-                        raise ValueError(f"Некорректный ответ API: {res}")
-                except Exception as e:
-                    print(f"\n[!] Ошибка на тексте '{text[:30]}': {e}")
-                    all_embeddings.append([0.0] * 1024) # Заполнитель
-                    
-        return torch.tensor(all_embeddings, dtype=torch.float32).to(self.device)
+class AppConfig(BaseSettings):
+    model_config = ConfigDict(env_prefix="GAP_", protected_namespaces=())
+    
+    ollama_url: HttpUrl = "http://localhost:11434/api/embed"
+    model_name: str = "mxbai-embed-large"
+    batch_size: int = 500
+    concurrent_requests: int = 10
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
-    def find_gaps(self, queries_df, catalog_df, batch_size=500):
-        """Поиск семантических разрывов между спросом и предложением."""
-        print("[*] Шаг 1: Векторизация данных...")
-        q_vecs = self._get_embeddings_batch(queries_df['query'].tolist())
-        p_vecs = self._get_embeddings_batch(catalog_df['product_name'].tolist())
+class NicheResult(BaseModel):
+    query: str
+    gap_score: float
+    volume: int
+    niche_index: float
+    cluster: int = -1
 
-        print("[*] Шаг 2: Расчет дистанций на GPU...")
-        min_distances = []
+# --- 2. Провайдер эмбеддингов ---
+
+class EmbeddingProvider(ABC):
+    @abstractmethod
+    async def get_embeddings(self, texts: List[str]) -> torch.Tensor:
+        pass
+
+class OllamaProvider(EmbeddingProvider):
+    def __init__(self, config: AppConfig):
+        self.config = config
+        self.semaphore = asyncio.Semaphore(config.concurrent_requests)
+
+    @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=1, min=2, max=10))
+    async def _fetch_one(self, client: httpx.AsyncClient, text: str) -> List[float]:
+        async with self.semaphore:
+            payload = {"model": self.config.model_name, "input": text}
+            resp = await client.post(str(self.config.ollama_url), json=payload, timeout=20.0)
+            resp.raise_for_status()
+            data = resp.json()
+            # Берем первый элемент, если API вернуло список списков
+            emb = data.get("embeddings") or data.get("embedding")
+            return emb[0] if isinstance(emb[0], list) else emb
+
+    async def get_embeddings(self, texts: List[str]) -> torch.Tensor:
+        async with httpx.AsyncClient() as client:
+            tasks = [self._fetch_one(client, t) for t in texts]
+            results = await tqdm.gather(*tasks, desc="Асинхронная векторизация")
+            # Явно приводим к 2D: [кол-во текстов, размер вектора]
+            return torch.tensor(results, dtype=torch.float32).to(self.config.device).view(len(texts), -1)
+
+# --- 3. Аналитический движок ---
+
+class BlueOceanEngine:
+    def __init__(self, config: AppConfig, provider: EmbeddingProvider):
+        self.config = config
+        self.provider = provider
+
+    def calculate_cosine_gap(self, q_vecs: torch.Tensor, p_vecs: torch.Tensor) -> torch.Tensor:
+        q_norm = torch.nn.functional.normalize(q_vecs, p=2, dim=1)
+        p_norm = torch.nn.functional.normalize(p_vecs, p=2, dim=1)
         
-        # Батчинг для защиты от переполнения VRAM (видеопамяти)
-        for i in range(0, len(q_vecs), batch_size):
-            q_batch = q_vecs[i : i+batch_size]
-            # Вычисляем попарные евклидовы расстояния
-            dists = torch.cdist(q_batch, p_vecs, p=2) 
-            min_d, _ = torch.min(dists, dim=1)
-            min_distances.append(min_d.cpu())
-            torch.cuda.empty_cache()
+        gaps = []
+        for i in range(0, len(q_norm), self.config.batch_size):
+            q_batch = q_norm[i : i + self.config.batch_size]
+            # Теперь p_norm гарантированно 2D, t() сработает корректно
+            sims = torch.mm(q_batch, p_norm.t())
+            max_sim, _ = torch.max(sims, dim=1)
+            gaps.append(1 - max_sim)
+            
+        return torch.cat(gaps)
 
-        gap_scores = torch.cat(min_distances).numpy()
-        queries_df['gap_score'] = gap_scores
-        
-        # Индекс ниши = (разрыв в смысле) * (логарифм частоты спроса)
-        queries_df['niche_index'] = queries_df['gap_score'] * np.log1p(queries_df['volume'])
-        
-        return queries_df, q_vecs
+    async def analyze(self, queries: pd.DataFrame, catalog: pd.DataFrame):
+        q_vecs = await self.provider.get_embeddings(queries['query'].tolist())
+        p_vecs = await self.provider.get_embeddings(catalog['product_name'].tolist())
 
-    def cluster_niches(self, df, vecs, threshold_percentile=50):
-        """Группировка запросов-пустот в товарные категории."""
-        # Фильтруем запросы, которые выше порога "необычности"
-        threshold = np.percentile(df['niche_index'], threshold_percentile)
-        n_mask = df['niche_index'] >= threshold
+        print(f"[*] Анализ {len(queries)} запросов против {len(catalog)} товаров...")
+        gap_scores = self.calculate_cosine_gap(q_vecs, p_vecs).cpu().numpy()
         
-        n_samples = n_mask.sum()
-        if n_samples < 2:
-            print(f"[*] Слишком мало данных для кластеризации (найдено: {n_samples})")
-            return df[n_mask]
+        queries['gap_score'] = gap_scores
+        queries['niche_index'] = queries['gap_score'] * np.log1p(queries['volume'])
+        
+        return self._cluster(queries, q_vecs)
 
-        niche_vecs = vecs[n_mask.values].cpu().numpy()
+    def _cluster(self, df: pd.DataFrame, vecs: torch.Tensor):
+        # Используем порог 50-й перцентили для теста, если данных мало
+        threshold = df['niche_index'].quantile(0.5) if len(df) < 10 else (df['niche_index'].mean() + df['niche_index'].std())
+        mask = df['niche_index'] >= threshold
         
-        # Настройка HDBSCAN для работы с малыми и шумными выборками
-        clusterer = HDBSCAN(min_cluster_size=2, metric='euclidean', copy=True)
-        clusters = clusterer.fit_predict(niche_vecs)
-        
-        # Создаем копию для вывода, чтобы не ломать основной DF
-        result_df = df[n_mask].copy()
-        result_df['cluster'] = clusters
-        return result_df
+        if mask.sum() < 2:
+            return df[mask]
 
-# --- Основной блок исполнения ---
+        target_vecs = vecs[mask.values].cpu().numpy()
+        clusterer = HDBSCAN(min_cluster_size=2, metric='euclidean')
+        
+        res_df = df[mask].copy()
+        res_df['cluster'] = clusterer.fit_predict(target_vecs)
+        return res_df
+
+# --- 4. Запуск ---
+
+async def main():
+    config = AppConfig()
+    provider = OllamaProvider(config)
+    engine = BlueOceanEngine(config, provider)
+
+    queries_data = pd.DataFrame({
+        'query': ["термос с usb подогревом", "беговая дорожка складная", "синий чехол", "умный ошейник с ИИ"],
+        'volume': [1500, 3200, 50000, 800]
+    })
+    catalog_data = pd.DataFrame({
+        'product_name': ["Обычный термос", "Чехол синий силикон", "Беговая дорожка стационарная"]
+    })
+
+    results = await engine.analyze(queries_data, catalog_data)
+
+    print("\n" + "="*60)
+    print(f"{'КЛАСТЕР':<12} | {'ЗАПРОС':<30} | {'INDEX':<7} | {'GAP'}")
+    print("-" * 60)
+    
+    if not results.empty:
+        for _, row in results.sort_values('niche_index', ascending=False).iterrows():
+            item = NicheResult(**row.to_dict())
+            c_tag = f"#{item.cluster}" if item.cluster != -1 else "UNIQ"
+            print(f"{c_tag:<12} | {item.query[:30]:<30} | {item.niche_index:>7.2f} | {item.gap_score:.2f}")
+
 if __name__ == "__main__":
-    # Спрос: что люди ищут, но чего может не быть
-    data_queries = {
-        'query': [
-            "термос для еды с подогревом от usb", 
-            "складная беговая дорожка под кровать",
-            "коврик для мышки с подогревом", 
-            "чехол на айфон синий с блестками", 
-            "куртка мужская осенняя мембранная"
-        ],
-        'volume': [4500, 12000, 800, 15000, 60000]
-    }
-    
-    # Предложение: что уже есть на полках (база конкурентов)
-    data_catalog = {
-        'product_name': [
-            "Обычный термос 1л стальной", 
-            "Беговая дорожка магнитная Pro", 
-            "Чехол на iPhone 15 прозрачный",
-            "Куртка зимняя на меху", 
-            "Коврик для мыши текстильный"
-        ]
-    }
-
-    queries_df = pd.DataFrame(data_queries)
-    catalog_df = pd.DataFrame(data_catalog)
-
-    # Инициализация и запуск
-    finder = BlueOceanFinder()
-    
-    # 1. Считаем разрывы
-    scored_df, all_q_vecs = finder.find_gaps(queries_df, catalog_df)
-    
-    # 2. Выделяем ниши (для теста 5 строк ставим низкий порог 40%)
-    niches_df = finder.cluster_niches(scored_df, all_q_vecs, threshold_percentile=40)
-
-    # 3. Красивый вывод
-    print("\n" + "="*50)
-    print("АНАЛИЗ 'ГОЛУБЫХ ОКЕАНОВ' (TOP NICHES 2026)")
-    print("="*50)
-
-    if not niches_df.empty:
-        # Сначала выводим не сгруппированные запросы, если кластеры не собрались
-        if (niches_df['cluster'] == -1).all():
-            print("\nУникальные перспективные запросы:")
-            print(niches_df.sort_values(by='niche_index', ascending=False)[['query', 'niche_index']])
-        else:
-            # Группировка по кластерам
-            for c_id in sorted(niches_df['cluster'].unique()):
-                cluster_data = niches_df[niches_df['cluster'] == c_id]
-                label = f"Ниша (Кластер #{c_id})" if c_id != -1 else "Разрозненные возможности"
-                print(f"\n{label}:")
-                for _, row in cluster_data.iterrows():
-                    print(f" - {row['query']} (Индекс: {row['niche_index']:.2f})")
-    else:
-        print("Ниш не обнаружено. Попробуйте снизить порог или расширить данные.")
+    asyncio.run(main())
